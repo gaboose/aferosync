@@ -32,6 +32,8 @@ type Sync struct {
 
 	upd PathUpdate
 	err error
+
+	summary Summary
 }
 
 func (s *Sync) BaseDir() (string, time.Time) {
@@ -167,6 +169,7 @@ func (s *Sync) Next() bool {
 		delete(s.pathMap, path)
 
 		if !s.upd.IsEmpty() {
+			s.summary.Add(s.upd.Update)
 			return true
 		}
 	}
@@ -223,6 +226,7 @@ func (s *Sync) Next() bool {
 				Deleted: true,
 			},
 		}
+		s.summary.Add(s.upd.Update)
 		return true
 	}
 
@@ -236,6 +240,10 @@ func (s *Sync) Update() PathUpdate {
 	}
 
 	return s.upd
+}
+
+func (s *Sync) Summary() Summary {
+	return s.summary
 }
 
 func (s *Sync) Err() error {

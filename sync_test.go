@@ -56,6 +56,8 @@ func TestMemMapFs(t *testing.T) {
 
 	// testSymlink(t, afs, opts...) // symlinks
 	// testLink(t, afs, opts...) // hard links
+
+	testSummary(t, afs, opts...)
 }
 
 func TestGuestFs(t *testing.T) {
@@ -90,6 +92,8 @@ func TestGuestFs(t *testing.T) {
 
 	testSymlink(t, afs)
 	testLink(t, afs)
+
+	testSummary(t, afs)
 }
 
 func testRegularFileAdd(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
@@ -1958,6 +1962,91 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			assert.Equal(t, []aferosync.PathUpdate(nil), updates)
 			assertEqualTars(t, bts, afs)
 		})
+	})
+}
+
+func testSummary(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
+	t.Run("Summary", func(t *testing.T) {
+		err := clear(afs)
+		require.Nil(t, err)
+
+		// build tar
+		bts, err := newTar([]struct {
+			Header tar.Header
+			Body   string
+		}{{
+			Header: tar.Header{
+				Name:    "./test1.txt",
+				Mode:    int64(fs.ModePerm),
+				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+			Body: "some text",
+		}, {
+			Header: tar.Header{
+				Name:    "./test4.txt",
+				Mode:    int64(fs.ModePerm),
+				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+			Body: "some text",
+		}, {
+			Header: tar.Header{
+				Name:    "./test5.txt",
+				Mode:    int64(fs.ModePerm),
+				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+			Body: "some text",
+		}, {
+			Header: tar.Header{
+				Name:    "./test6.txt",
+				Mode:    int64(fs.ModePerm),
+				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+			Body: "some text",
+		}, {
+			Header: tar.Header{
+				Name:    "./test7.txt",
+				Mode:    int64(fs.ModePerm),
+				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+			Body: "some text",
+		}})
+		require.Nil(t, err)
+
+		// sync
+		err = afero.WriteFile(afs, "test2.txt", []byte("some text"), fs.ModePerm)
+		require.Nil(t, err)
+		err = afero.WriteFile(afs, "test3.txt", []byte("some text"), fs.ModePerm)
+		require.Nil(t, err)
+		err = afero.WriteFile(afs, "test4.txt", []byte("some text"), 0644)
+		require.Nil(t, err)
+		err = afs.Chtimes("test4.txt", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		require.Nil(t, err)
+		err = afero.WriteFile(afs, "test5.txt", []byte("some text"), 0644)
+		require.Nil(t, err)
+		err = afs.Chtimes("test5.txt", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		require.Nil(t, err)
+		err = afero.WriteFile(afs, "test6.txt", []byte("some text"), 0644)
+		require.Nil(t, err)
+		err = afs.Chtimes("test6.txt", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		require.Nil(t, err)
+		err = afero.WriteFile(afs, "test7.txt", []byte("some text"), fs.ModePerm)
+		require.Nil(t, err)
+		err = afs.Chtimes("test7.txt", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		require.Nil(t, err)
+
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+		for sync.Next() {
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assert.Equal(t, aferosync.Summary{
+			Added:   1,
+			Deleted: 2,
+			Updated: 3,
+		}, sync.Summary())
+
+		assertEqualTars(t, bts, afs)
 	})
 }
 
