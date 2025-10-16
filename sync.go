@@ -11,7 +11,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/gaboose/afero-guestfs/libguestfs.org/guestfs"
 	"github.com/spf13/afero"
 )
 
@@ -110,9 +109,9 @@ func (s *Sync) Next() bool {
 
 	if s.pathMap == nil {
 		var err error
-		s.pathMap, err = s.walkFs()
+		s.pathMap, err = s.allPathsMap()
 		if err != nil {
-			s.err = fmt.Errorf("failed to walk disk: %w", err)
+			s.err = err
 			return false
 		}
 	}
@@ -250,60 +249,18 @@ func (s *Sync) Err() error {
 	return s.err
 }
 
-func (s *Sync) walkFs() (map[string]struct{}, error) {
-	ret := map[string]struct{}{}
-	walker, ok := s.fs.(interface {
-		Walk(root string, walkFn filepath.WalkFunc) error
-	})
-
-	if ok {
-		if err := walker.Walk(".", filepath.WalkFunc(func(path string, info fs.FileInfo, err error) error {
-			ret[normalizePath(path)] = struct{}{}
-			return nil
-		})); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := afero.Walk(s.fs, ".", filepath.WalkFunc(func(path string, info fs.FileInfo, err error) error {
-			ret[normalizePath(path)] = struct{}{}
-			return nil
-		})); err != nil {
-			return nil, err
-		}
-	}
-
-	return ret, nil
-}
-
-func walkDiskTSK(g *guestfs.Guestfs) (map[string]struct{}, error) {
-	mps, err := g.Mountpoints()
+func (s *Sync) allPathsMap() (map[string]struct{}, error) {
+	paths, err := AllPaths(s.fs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get mount points: %w", err)
+		return nil, fmt.Errorf("failed to get all paths: %w", err)
 	}
 
-	var partDevice string
-	for d, mp := range mps {
-		if mp == "/" {
-			partDevice = d
-			break
-		}
+	pathsMap := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		pathsMap[p] = struct{}{}
 	}
 
-	if partDevice == "" {
-		return nil, fmt.Errorf("nothing mounted at root")
-	}
-
-	entries, err := g.Filesystem_walk(partDevice)
-	if err != nil {
-		return nil, fmt.Errorf("failed to walk disk: %w", err)
-	}
-
-	diskPathMap := make(map[string]struct{}, len(*entries))
-	for _, e := range *entries {
-		diskPathMap[normalizePath(e.Tsk_name)] = struct{}{}
-	}
-
-	return diskPathMap, nil
+	return pathsMap, nil
 }
 
 func (s *Sync) syncRegularFile(hdr *tar.Header) error {

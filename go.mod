@@ -3,7 +3,7 @@ module github.com/gaboose/aferosync
 go 1.25.1
 
 require (
-	github.com/gaboose/afero-guestfs v0.0.12
+	github.com/gaboose/afero-guestfs v0.0.13
 	github.com/spf13/afero v1.15.0
 	github.com/stretchr/testify v1.11.1
 )
