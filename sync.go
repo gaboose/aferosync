@@ -135,12 +135,10 @@ func (s *Sync) Next() bool {
 		case tar.TypeReg:
 			if err := s.syncRegularFile(hdr); err != nil {
 				s.err = fmt.Errorf("failed to sync regular file: %s: %w", path, err)
-				return false
 			}
 		case tar.TypeDir:
 			if err := s.syncDir(hdr); err != nil {
 				s.err = fmt.Errorf("failed to sync dir: %s: %w", path, err)
-				return false
 			}
 		case tar.TypeSymlink:
 			if !s.opts.withSymlinks {
@@ -149,7 +147,6 @@ func (s *Sync) Next() bool {
 
 			if err := s.syncSymlink(hdr); err != nil {
 				s.err = fmt.Errorf("failed to sync symlink: %s: %w", path, err)
-				return false
 			}
 		case tar.TypeLink:
 			if !s.opts.withHardLinks {
@@ -158,14 +155,21 @@ func (s *Sync) Next() bool {
 
 			if err := s.syncLink(hdr); err != nil {
 				s.err = fmt.Errorf("failed to sync hard link: %s: %w", path, err)
-				return false
 			}
 		default:
 			s.err = fmt.Errorf("unexpected file type in tar: %s: %d", path, hdr.Typeflag)
-			return false
 		}
 
 		delete(s.pathMap, path)
+
+		if s.err != nil {
+			if !s.opts.withIgnoreErrors {
+				return false
+			}
+
+			s.upd.Error = s.err
+			s.err = nil
+		}
 
 		if !s.upd.IsEmpty() {
 			s.summary.Add(s.upd.Update)
@@ -185,52 +189,67 @@ func (s *Sync) Next() bool {
 	// delete files
 	for len(s.deletePaths) > 0 {
 		path := s.deletePaths[0]
-
-		// ignore root path
-		if path == "." {
-			s.deletePaths = s.deletePaths[1:]
-			continue
-		}
-
-		if _, _, err := LstatOrStat(s.fs, path); errors.Is(err, fs.ErrNotExist) {
-			// ignore paths that don't exist
-			// some paths appear in the guestfs.Guestfs.Filesystem_walk results but can't be
-			// accessed via Lstat or removed, these for example include:
-			// - /$OrphanFiles
-			// - /lib/modules/5.15.78-v8/build/include/config/\xa
-			// - /usr/share/mime/application/\x2
-			// - /var/lib/opkg/info/\xf
-			// - /var/lib/opkg/info/'
-			// - /var/lib/opkg/info/^
-			// - /var/lib/opkg/info/\x81
-			s.deletePaths = s.deletePaths[1:]
-			continue
-		} else if err != nil {
-			s.err = fmt.Errorf("failed to stat: %s: %w", path, err)
-		}
-
-		if err := s.preserveBaseDir(filepath.Dir(path)); err != nil {
-			s.err = err
-			return false
-		}
-
-		if err := s.fs.RemoveAll(path); err != nil {
-			s.err = fmt.Errorf("failed to remove: %s: %w", path, err)
-			return false
-		}
+		s.deletePaths = s.deletePaths[1:]
 
 		s.upd = PathUpdate{
 			Path: path,
-			Update: Update{
-				Deleted: true,
-			},
 		}
-		s.summary.Add(s.upd.Update)
-		return true
+
+		if err := s.remove(path); err != nil {
+			s.err = fmt.Errorf("failed to remove: %s: %w", path, err)
+		}
+
+		if s.err != nil {
+			if !s.opts.withIgnoreErrors {
+				return false
+			}
+
+			s.upd.Error = s.err
+			s.err = nil
+		}
+
+		if !s.upd.IsEmpty() {
+			s.summary.Add(s.upd.Update)
+			return true
+		}
 	}
 
 	s.err = s.preserveBaseDir("")
 	return false
+}
+
+func (s *Sync) remove(path string) error {
+	// ignore root path
+	if path == "." {
+		return nil
+	}
+
+	if _, _, err := LstatOrStat(s.fs, path); errors.Is(err, fs.ErrNotExist) {
+		// ignore paths that don't exist
+		// some paths appear in the guestfs.Guestfs.Filesystem_walk results but can't be
+		// accessed via Lstat or removed, these for example include:
+		// - /$OrphanFiles
+		// - /lib/modules/5.15.78-v8/build/include/config/\xa
+		// - /usr/share/mime/application/\x2
+		// - /var/lib/opkg/info/\xf
+		// - /var/lib/opkg/info/'
+		// - /var/lib/opkg/info/^
+		// - /var/lib/opkg/info/\x81
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to stat: %s: %w", path, err)
+	}
+
+	if err := s.preserveBaseDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+
+	if err := s.fs.RemoveAll(path); err != nil {
+		return fmt.Errorf("failed to remove: %s: %w", path, err)
+	}
+
+	s.upd.Deleted = true
+	return nil
 }
 
 func (s *Sync) Update() PathUpdate {

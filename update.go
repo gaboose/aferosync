@@ -20,6 +20,7 @@ type Update struct {
 	Gid     *int
 	ModTime *time.Time
 	Link    *string
+	Error   error
 }
 
 func (upd Update) IsEmpty() bool {
@@ -35,6 +36,8 @@ func (upd PathUpdate) String() string {
 		}
 	} else if upd.Deleted {
 		return fmt.Sprintf("deleted %s", upd.Path)
+	} else if upd.Error != nil {
+		return fmt.Sprintf("error %s: %s", upd.Path, upd.Error)
 	}
 
 	parts := make([]string, 0, 6)

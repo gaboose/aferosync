@@ -19,6 +19,9 @@ func AllPaths(afs afero.Fs) ([]string, error) {
 
 	var paths []string
 	if err := afero.Walk(afs, ".", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		paths = append(paths, path)
 		return nil
 	}); err != nil {

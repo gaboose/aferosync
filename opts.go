@@ -1,9 +1,10 @@
 package aferosync
 
 type options struct {
-	withSymlinks  bool
-	withHardLinks bool
-	withOwnership bool
+	withSymlinks     bool
+	withHardLinks    bool
+	withOwnership    bool
+	withIgnoreErrors bool
 }
 
 type Option func(opts *options)
@@ -29,5 +30,11 @@ func WithHardLinks(v bool) Option {
 func WithOwnership(v bool) Option {
 	return func(opts *options) {
 		opts.withOwnership = v
+	}
+}
+
+func WithIgnoreErrors(v bool) Option {
+	return func(opts *options) {
+		opts.withIgnoreErrors = v
 	}
 }

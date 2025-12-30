@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var testError = errors.New("test error")
 
 func TestMemMapFs(t *testing.T) {
 	afs := afero.NewMemMapFs()
@@ -97,27 +100,27 @@ func TestGuestFs(t *testing.T) {
 }
 
 func testRegularFileAdd(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
+	// build tar
+	tarBts, err := newTar([]struct {
+		Header tar.Header
+		Body   string
+	}{{
+		Header: tar.Header{
+			Name:    "./test.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}})
+	require.Nil(t, err)
+
 	t.Run("RegularFile/Add", func(t *testing.T) {
 		err := clear(afs)
 		require.Nil(t, err)
 
-		// build tar
-		bts, err := newTar([]struct {
-			Header tar.Header
-			Body   string
-		}{{
-			Header: tar.Header{
-				Name:    "./test.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}})
-		require.Nil(t, err)
-
 		// sync
 		var updates []aferosync.PathUpdate
-		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 		for sync.Next() {
 			updates = append(updates, sync.Update())
 		}
@@ -133,26 +136,71 @@ func testRegularFileAdd(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			},
 		}}, updates)
 
-		assertEqualTars(t, bts, afs)
+		assertEqualTars(t, tarBts, afs)
 	})
-}
 
-func testRegularFileDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
-	t.Run("RegularFile/Delete", func(t *testing.T) {
+	t.Run("RegularFile/Add/Error", func(t *testing.T) {
 		err := clear(afs)
 		require.Nil(t, err)
 
-		// build tar
-		bts, err := newTar(nil)
-		require.Nil(t, err)
+		// sync
+		sync := aferosync.New(testFs{
+			create: func(name string) (afero.File, error) {
+				return nil, errors.New("test error")
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+		ok := sync.Next()
+		assert.False(t, ok)
+		assert.NotNil(t, sync.Err())
+	})
 
-		// build disk
-		err = afero.WriteFile(afs, "test.txt", []byte("some text"), fs.ModePerm)
+	t.Run("RegularFile/Add/IgnoreError", func(t *testing.T) {
+		err := clear(afs)
 		require.Nil(t, err)
 
 		// sync
 		var updates []aferosync.PathUpdate
-		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+		sync := aferosync.New(testFs{
+			create: func(name string) (afero.File, error) {
+				return nil, testError
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+		for sync.Next() {
+			updates = append(updates, sync.Update())
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+			Path: "test.txt",
+			Update: aferosync.Update{
+				Error: testError,
+			},
+		}}, updates)
+	})
+}
+
+func testRegularFileDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
+	// build tar
+	tarBts, err := newTar(nil)
+	require.Nil(t, err)
+
+	buildDisk := func() {
+		err := clear(afs)
+		require.Nil(t, err)
+
+		err = afero.WriteFile(afs, "test.txt", []byte("some text"), fs.ModePerm)
+		require.Nil(t, err)
+	}
+
+	t.Run("RegularFile/Delete", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		var updates []aferosync.PathUpdate
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 		for sync.Next() {
 			updates = append(updates, sync.Update())
 		}
@@ -166,7 +214,54 @@ func testRegularFileDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option)
 			},
 		}}, updates)
 
-		assertEqualTars(t, bts, afs)
+		assertEqualTars(t, tarBts, afs)
+	})
+
+	t.Run("RegularFile/Delete/Error", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		sync := aferosync.New(testFs{
+			lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+				return nil, false, errors.New("test error")
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+		ok := sync.Next()
+		if ok {
+			fmt.Println("DEBUG", sync.Update())
+		}
+		assert.False(t, ok)
+		assert.NotNil(t, sync.Err())
+	})
+
+	t.Run("RegularFile/Delete/IgnoreError", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		var updates []aferosync.PathUpdate
+		sync := aferosync.New(testFs{
+			lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+				if name == "test.txt" {
+					return nil, false, testError
+				} else {
+					return aferosync.LstatOrStat(afs, name)
+				}
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+		for sync.Next() {
+			updates = append(updates, sync.Update())
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+			Path: "test.txt",
+			Update: aferosync.Update{
+				Error: testError,
+			},
+		}}, updates)
 	})
 }
 
@@ -543,26 +638,26 @@ func testRegularFileNoop(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 }
 
 func testDirAdd(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
+	// build tar
+	tarBts, err := newTar([]struct {
+		Header tar.Header
+		Body   string
+	}{{
+		Header: tar.Header{
+			Name:    "./etc/",
+			Mode:    0755,
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}})
+	require.Nil(t, err)
+
 	t.Run("Dir/Add", func(t *testing.T) {
 		err := clear(afs)
 		require.Nil(t, err)
 
-		// build tar
-		bts, err := newTar([]struct {
-			Header tar.Header
-			Body   string
-		}{{
-			Header: tar.Header{
-				Name:    "./etc/",
-				Mode:    0755,
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-		}})
-		require.Nil(t, err)
-
 		// sync
 		var updates []aferosync.PathUpdate
-		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 		for sync.Next() {
 			updates = append(updates, sync.Update())
 		}
@@ -578,26 +673,71 @@ func testDirAdd(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			},
 		}}, updates)
 
-		assertEqualTars(t, bts, afs)
+		assertEqualTars(t, tarBts, afs)
 	})
-}
 
-func testDirDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
-	t.Run("Dir/Delete", func(t *testing.T) {
+	t.Run("Dir/Add/Error", func(t *testing.T) {
 		err := clear(afs)
 		require.Nil(t, err)
 
-		// build tar
-		bts, err := newTar(nil)
-		require.Nil(t, err)
+		// sync
+		sync := aferosync.New(testFs{
+			mkdir: func(name string, perm os.FileMode) error {
+				return errors.New("test error")
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+		ok := sync.Next()
+		assert.False(t, ok)
+		assert.NotNil(t, sync.Err())
+	})
 
-		// build disk
-		err = afs.Mkdir("etc", 0644)
+	t.Run("Dir/Add/IgnoreError", func(t *testing.T) {
+		err := clear(afs)
 		require.Nil(t, err)
 
 		// sync
 		var updates []aferosync.PathUpdate
-		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+		sync := aferosync.New(testFs{
+			mkdir: func(name string, perm os.FileMode) error {
+				return testError
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+		for sync.Next() {
+			updates = append(updates, sync.Update())
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+			Path: "etc",
+			Update: aferosync.Update{
+				Error: testError,
+			},
+		}}, updates)
+	})
+}
+
+func testDirDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
+	// build tar
+	tarBts, err := newTar(nil)
+	require.Nil(t, err)
+
+	buildDisk := func() {
+		err := clear(afs)
+		require.Nil(t, err)
+
+		err = afs.Mkdir("etc", 0644)
+		require.Nil(t, err)
+	}
+
+	t.Run("Dir/Delete", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		var updates []aferosync.PathUpdate
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 		for sync.Next() {
 			updates = append(updates, sync.Update())
 		}
@@ -611,7 +751,53 @@ func testDirDelete(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			},
 		}}, updates)
 
-		assertEqualTars(t, bts, afs)
+		assertEqualTars(t, tarBts, afs)
+	})
+
+	t.Run("Dir/Delete/Error", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		sync := aferosync.New(testFs{
+			lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+				return nil, false, errors.New("test error")
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+		ok := sync.Next()
+		if ok {
+			fmt.Println("DEBUG", sync.Update())
+		}
+		assert.False(t, ok)
+		assert.NotNil(t, sync.Err())
+	})
+
+	t.Run("Dir/Delete/IgnoreError", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		var updates []aferosync.PathUpdate
+		sync := aferosync.New(testFs{
+			lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+				if name == "etc" {
+					return nil, false, testError
+				}
+				return aferosync.LstatOrStat(afs, name)
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+		for sync.Next() {
+			updates = append(updates, sync.Update())
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+			Path: "etc",
+			Update: aferosync.Update{
+				Error: testError,
+			},
+		}}, updates)
 	})
 }
 
@@ -1306,7 +1492,7 @@ func testSymlink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			require.Nil(t, err)
 
 			// build tar
-			bts, err := newTar([]struct {
+			tarBts, err := newTar([]struct {
 				Header tar.Header
 				Body   string
 			}{{
@@ -1322,7 +1508,7 @@ func testSymlink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 
 			// sync
 			var updates []aferosync.PathUpdate
-			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 			for sync.Next() {
 				updates = append(updates, sync.Update())
 			}
@@ -1338,24 +1524,71 @@ func testSymlink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 				},
 			}}, updates)
 
-			assertEqualTars(t, bts, afs)
+			assertEqualTars(t, tarBts, afs)
+
+			t.Run("Error", func(t *testing.T) {
+				err := clear(afs)
+				require.Nil(t, err)
+
+				// sync
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						return nil, false, errors.New("test error")
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+				ok := sync.Next()
+				assert.False(t, ok)
+				assert.NotNil(t, sync.Err())
+			})
+
+			t.Run("IgnoreError", func(t *testing.T) {
+				err := clear(afs)
+				require.Nil(t, err)
+
+				// sync
+				var updates []aferosync.PathUpdate
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						if name == "link" {
+							return nil, false, testError
+						}
+						return aferosync.LstatOrStat(afs, name)
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+				for sync.Next() {
+					updates = append(updates, sync.Update())
+				}
+				require.Nil(t, sync.Err())
+
+				// assert
+				assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+					Path: "link",
+					Update: aferosync.Update{
+						Error: testError,
+					},
+				}}, updates)
+			})
 		})
 
 		t.Run("Delete", func(t *testing.T) {
-			err := clear(afs)
-			require.Nil(t, err)
-
 			// build tar
-			bts, err := newTar(nil)
+			tarBts, err := newTar(nil)
 			require.Nil(t, err)
 
-			// build disk
-			err = afs.(afero.Symlinker).SymlinkIfPossible("/target", "link")
-			require.Nil(t, err)
+			buildDisk := func() {
+				err := clear(afs)
+				require.Nil(t, err)
+
+				err = afs.(afero.Symlinker).SymlinkIfPossible("/target", "link")
+				require.Nil(t, err)
+			}
+			buildDisk()
 
 			// sync
 			var updates []aferosync.PathUpdate
-			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 			for sync.Next() {
 				updates = append(updates, sync.Update())
 			}
@@ -1369,7 +1602,50 @@ func testSymlink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 				},
 			}}, updates)
 
-			assertEqualTars(t, bts, afs)
+			assertEqualTars(t, tarBts, afs)
+
+			t.Run("Error", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						return nil, false, errors.New("test error")
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+				ok := sync.Next()
+				assert.False(t, ok)
+				assert.NotNil(t, sync.Err())
+			})
+
+			t.Run("IgnoreError", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				var updates []aferosync.PathUpdate
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						if name == "link" {
+							return nil, false, testError
+						}
+						return aferosync.LstatOrStat(afs, name)
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+				for sync.Next() {
+					updates = append(updates, sync.Update())
+				}
+				require.Nil(t, sync.Err())
+
+				// assert
+				assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+					Path: "link",
+					Update: aferosync.Update{
+						Error: testError,
+					},
+				}}, updates)
+			})
 		})
 
 		t.Run("Chown", func(t *testing.T) {
@@ -1646,11 +1922,8 @@ func testSymlink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 	t.Run("Link", func(t *testing.T) {
 		t.Run("Add", func(t *testing.T) {
-			err := clear(afs)
-			require.Nil(t, err)
-
 			// build tar
-			bts, err := newTar([]struct {
+			tarBts, err := newTar([]struct {
 				Header tar.Header
 				Body   string
 			}{{
@@ -1671,15 +1944,20 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			}})
 			require.Nil(t, err)
 
-			// build disk
-			err = afero.WriteFile(afs, "atarget", []byte("some text"), fs.ModePerm)
-			require.Nil(t, err)
-			err = afs.Chtimes("atarget", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
-			require.Nil(t, err)
+			buildDisk := func() {
+				err := clear(afs)
+				require.Nil(t, err)
+
+				err = afero.WriteFile(afs, "atarget", []byte("some text"), fs.ModePerm)
+				require.Nil(t, err)
+				err = afs.Chtimes("atarget", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+				require.Nil(t, err)
+			}
+			buildDisk()
 
 			// sync
 			var updates []aferosync.PathUpdate
-			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 			for sync.Next() {
 				updates = append(updates, sync.Update())
 			}
@@ -1699,15 +1977,55 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			assert.Nil(t, err)
 			assert.Equal(t, targetfi.(aferosync.FileInfoInoer).Ino(), linkfi.(aferosync.FileInfoInoer).Ino())
 
-			assertEqualTars(t, bts, afs)
+			assertEqualTars(t, tarBts, afs)
+
+			t.Run("Error", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						return nil, false, errors.New("test error")
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+				ok := sync.Next()
+				assert.False(t, ok)
+				assert.NotNil(t, sync.Err())
+			})
+
+			t.Run("IgnoreError", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				var updates []aferosync.PathUpdate
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						if name == "link" {
+							return nil, false, testError
+						}
+						return aferosync.LstatOrStat(afs, name)
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+				for sync.Next() {
+					updates = append(updates, sync.Update())
+				}
+				require.Nil(t, sync.Err())
+
+				// assert
+				assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+					Path: "link",
+					Update: aferosync.Update{
+						Error: testError,
+					},
+				}}, updates)
+			})
 		})
 
 		t.Run("Delete", func(t *testing.T) {
-			err := clear(afs)
-			require.Nil(t, err)
-
 			// build tar
-			bts, err := newTar([]struct {
+			tarBts, err := newTar([]struct {
 				Header tar.Header
 				Body   string
 			}{{
@@ -1720,16 +2038,21 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			}})
 			require.Nil(t, err)
 
-			// build disk
-			afero.WriteFile(afs, "atarget", []byte("some text"), fs.ModePerm)
-			require.Nil(t, err)
-			afs.Chtimes("atarget", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
-			err = afs.(aferosync.Linker).Link("/atarget", "link")
-			require.Nil(t, err)
+			buildDisk := func() {
+				err := clear(afs)
+				require.Nil(t, err)
+
+				afero.WriteFile(afs, "atarget", []byte("some text"), fs.ModePerm)
+				require.Nil(t, err)
+				afs.Chtimes("atarget", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+				err = afs.(aferosync.Linker).Link("/atarget", "link")
+				require.Nil(t, err)
+			}
+			buildDisk()
 
 			// sync
 			var updates []aferosync.PathUpdate
-			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+			sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 			for sync.Next() {
 				updates = append(updates, sync.Update())
 			}
@@ -1743,7 +2066,50 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 				},
 			}}, updates)
 
-			assertEqualTars(t, bts, afs)
+			assertEqualTars(t, tarBts, afs)
+
+			t.Run("Error", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						return nil, false, errors.New("test error")
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
+				ok := sync.Next()
+				assert.False(t, ok)
+				assert.NotNil(t, sync.Err())
+			})
+
+			t.Run("IgnoreError", func(t *testing.T) {
+				buildDisk()
+
+				// sync
+				var updates []aferosync.PathUpdate
+				sync := aferosync.New(testFs{
+					lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+						if name == "link" {
+							return nil, false, testError
+						}
+						return aferosync.LstatOrStat(afs, name)
+					},
+					Fs: afs,
+				}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+				for sync.Next() {
+					updates = append(updates, sync.Update())
+				}
+				require.Nil(t, sync.Err())
+
+				// assert
+				assertEqualPathUpdates(t, []aferosync.PathUpdate{{
+					Path: "link",
+					Update: aferosync.Update{
+						Error: testError,
+					},
+				}}, updates)
+			})
 		})
 
 		t.Run("Overwrite/Link", func(t *testing.T) {
@@ -1966,53 +2332,52 @@ func testLink(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 }
 
 func testSummary(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
-	t.Run("Summary", func(t *testing.T) {
+	// build tar
+	tarBts, err := newTar([]struct {
+		Header tar.Header
+		Body   string
+	}{{
+		Header: tar.Header{
+			Name:    "./test1.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}, {
+		Header: tar.Header{
+			Name:    "./test4.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}, {
+		Header: tar.Header{
+			Name:    "./test5.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}, {
+		Header: tar.Header{
+			Name:    "./test6.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}, {
+		Header: tar.Header{
+			Name:    "./test7.txt",
+			Mode:    int64(fs.ModePerm),
+			ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Body: "some text",
+	}})
+	require.Nil(t, err)
+
+	buildDisk := func() {
 		err := clear(afs)
 		require.Nil(t, err)
 
-		// build tar
-		bts, err := newTar([]struct {
-			Header tar.Header
-			Body   string
-		}{{
-			Header: tar.Header{
-				Name:    "./test1.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}, {
-			Header: tar.Header{
-				Name:    "./test4.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}, {
-			Header: tar.Header{
-				Name:    "./test5.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}, {
-			Header: tar.Header{
-				Name:    "./test6.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}, {
-			Header: tar.Header{
-				Name:    "./test7.txt",
-				Mode:    int64(fs.ModePerm),
-				ModTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			},
-			Body: "some text",
-		}})
-		require.Nil(t, err)
-
-		// sync
 		err = afero.WriteFile(afs, "test2.txt", []byte("some text"), fs.ModePerm)
 		require.Nil(t, err)
 		err = afero.WriteFile(afs, "test3.txt", []byte("some text"), fs.ModePerm)
@@ -2033,8 +2398,13 @@ func testSummary(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 		require.Nil(t, err)
 		err = afs.Chtimes("test7.txt", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
 		require.Nil(t, err)
+	}
 
-		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(bts)), opts...)
+	t.Run("Summary", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		sync := aferosync.New(afs, tar.NewReader(bytes.NewBuffer(tarBts)), opts...)
 		for sync.Next() {
 		}
 		require.Nil(t, sync.Err())
@@ -2046,7 +2416,30 @@ func testSummary(t *testing.T, afs afero.Fs, opts ...aferosync.Option) {
 			Updated: 3,
 		}, sync.Summary())
 
-		assertEqualTars(t, bts, afs)
+		assertEqualTars(t, tarBts, afs)
+	})
+
+	t.Run("Summary/Errors", func(t *testing.T) {
+		buildDisk()
+
+		// sync
+		sync := aferosync.New(testFs{
+			lstatIfPossible: func(name string) (os.FileInfo, bool, error) {
+				if strings.HasPrefix(name, "test") {
+					return nil, false, testError
+				}
+				return aferosync.LstatOrStat(afs, name)
+			},
+			Fs: afs,
+		}, tar.NewReader(bytes.NewBuffer(tarBts)), append([]aferosync.Option{aferosync.WithIgnoreErrors(true)}, opts...)...)
+		for sync.Next() {
+		}
+		require.Nil(t, sync.Err())
+
+		// assert
+		assert.Equal(t, aferosync.Summary{
+			Errors: 7,
+		}, sync.Summary())
 	})
 }
 
@@ -2285,4 +2678,114 @@ func posixMode(i os.FileMode) (o uint32) {
 		o |= syscall.S_ISVTX
 	}
 	return
+}
+
+type testFs struct {
+	lstatIfPossible func(name string) (os.FileInfo, bool, error)
+	stat            func(name string) (os.FileInfo, error)
+	create          func(name string) (afero.File, error)
+	openFile        func(name string, flag int, perm os.FileMode) (afero.File, error)
+	mkdir           func(name string, perm os.FileMode) error
+	mkdirAll        func(path string, perm os.FileMode) error
+	afero.Fs
+}
+
+func (fs testFs) Stat(name string) (os.FileInfo, error) {
+	if fs.stat != nil {
+		return fs.stat(name)
+	}
+	return fs.Fs.Stat(name)
+}
+
+func (fs testFs) Create(name string) (afero.File, error) {
+	if fs.create != nil {
+		return fs.create(name)
+	}
+
+	return fs.Fs.Create(name)
+}
+
+func (fs testFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	if fs.openFile != nil {
+		return fs.openFile(name, flag, perm)
+	}
+
+	return fs.Fs.OpenFile(name, flag, perm)
+}
+
+func (fs testFs) Mkdir(name string, perm os.FileMode) error {
+	if fs.mkdir != nil {
+		return fs.mkdir(name, perm)
+	}
+
+	return fs.Fs.Mkdir(name, perm)
+}
+
+func (fs testFs) MkdirAll(path string, perm os.FileMode) error {
+	if fs.mkdirAll != nil {
+		return fs.mkdirAll(path, perm)
+	}
+
+	return fs.Fs.MkdirAll(path, perm)
+}
+
+func (fs testFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
+	if fs.lstatIfPossible != nil {
+		return fs.lstatIfPossible(name)
+	}
+
+	return aferosync.LstatOrStat(fs.Fs, name)
+}
+
+func (fs testFs) ReadlinkIfPossible(name string) (string, error) {
+	if linkReader, ok := fs.Fs.(afero.LinkReader); ok {
+		return linkReader.ReadlinkIfPossible(name)
+	}
+
+	return "", afero.ErrNoReadlink
+}
+
+func (fs testFs) SymlinkIfPossible(oldname string, newname string) error {
+	if symlinker, ok := fs.Fs.(afero.Symlinker); ok {
+		return symlinker.SymlinkIfPossible(oldname, newname)
+	}
+
+	return afero.ErrNoSymlink
+}
+
+func (fs testFs) Lchown(name string, uid int, gid int) error {
+	if lchowner, ok := fs.Fs.(aferosync.Lchowner); ok {
+		return lchowner.Lchown(name, uid, gid)
+	}
+
+	panic("unimplemented")
+}
+
+// Link implements aferosync.Linker.
+func (fs testFs) Link(oldname string, newname string) error {
+	if linker, ok := fs.Fs.(aferosync.Linker); ok {
+		return linker.Link(oldname, newname)
+	}
+
+	panic("unimplemented")
+}
+
+func (fs testFs) AllPaths() ([]string, error) {
+	return aferosync.AllPaths(fs.Fs)
+}
+
+var _ afero.Fs = testFs{}
+var _ afero.Symlinker = testFs{}
+var _ aferosync.AllPathser = testFs{}
+var _ aferosync.Lchowner = testFs{}
+var _ aferosync.Linker = testFs{}
+
+func assertEqualPathUpdates(t *testing.T, expected, actual []aferosync.PathUpdate) {
+	for i := 0; i < len(actual) && i < len(expected); i++ {
+		if errors.Is(actual[i].Update.Error, expected[i].Update.Error) {
+			expected[i].Update.Error = actual[i].Update.Error
+		}
+	}
+
+	assert.Equal(t, expected, actual)
 }
